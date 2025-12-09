@@ -1,6 +1,8 @@
 # HN Time Capsule
 
-A Hacker News time capsule project that pulls the HN frontpage from exactly 10 years ago, analyzes articles and discussions using an LLM to evaluate prescience with the benefit of hindsight, and generates an HTML report.
+![hero](hnhero.png)
+
+A Hacker News time capsule project that pulls the HN frontpage from exactly 10 years ago, analyzes articles and discussions using an LLM to evaluate prescience with the benefit of hindsight, and generates an HTML report. Also see [my short blog post about this repo](https://karpathy.bearblog.dev/auto-grade-hn/) for more context.
 
 ## What it does
 
@@ -10,7 +12,11 @@ A Hacker News time capsule project that pulls the HN frontpage from exactly 10 y
 4. Parses LLM responses to extract grades for each commenter
 5. Renders an HTML summary with all analyses and grades
 
-The goal is to find which HN commenters were most prescient or most wrong over time, and surface interesting predictions from a decade ago.
+The goal is to find which HN commenters were most prescient or most wrong over time, and surface interesting predictions from a decade ago. The more general and interesting idea is that of LLMs automatically scouring human artifacts from the past and synthesizing them into knowledge and insights.
+
+## Vibe code alert
+
+99% of this repo was vibe coded in a few hours with Opus 4.5. Code is provided as is and I don't intend to support it.
 
 ## Setup
 
@@ -18,7 +24,7 @@ The goal is to find which HN commenters were most prescient or most wrong over t
 # Install dependencies
 uv sync
 
-# Set up OpenAI API key
+# Set up OpenAI API key into a .env file
 echo "OPENAI_API_KEY=your-key-here" > .env
 ```
 
@@ -67,10 +73,7 @@ data/
 
 ## Files
 
-- `pipeline.py` - Main pipeline with all stages (fetch, prompt, analyze, parse, render)
-- `parse_grades.py` - Standalone grade parser for testing
-- `main.py` - Original single-file prototype (deprecated, use pipeline.py)
-- `prompt.txt` - The prompt template used for LLM analysis
+- `pipeline.py` - Main pipeline with all stages (clean, fetch, prompt, analyze, parse, render)
 
 ## Example Output
 
@@ -80,4 +83,8 @@ The LLM analyzes each article and its discussion, then:
 3. Notes fun/notable aspects of the discussion
 4. Grades each commenter (A+ to F) based on how their comments aged
 
-Grades are parsed and aggregated so you can track which HN accounts have the best prediction track records over time.
+Grades are parsed and aggregated in the Hall of Fame so we can track which HN accounts have the best prediction track records over time.
+
+## License
+
+MIT

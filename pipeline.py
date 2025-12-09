@@ -8,18 +8,21 @@ Stages:
 4. parse    - Parse grades from LLM responses
 5. render   - Generate HTML summary
 """
-
+from __future__ import annotations
 import json
 import os
 import re
 import html
 import time
+import random
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field, asdict
 from datetime import date
 from html.parser import HTMLParser
 from pathlib import Path
+
+import requests
 
 
 # -----------------------------------------------------------------------------
@@ -196,21 +199,34 @@ class ArticleTextParser(HTMLParser):
 # Fetching functions
 # -----------------------------------------------------------------------------
 
-def fetch_url(url: str, retries: int = 3, timeout: int = 15) -> str:
-    """Fetch URL content with retry logic."""
+def fetch_url(url: str, retries: int = 5, timeout: int = 15) -> str:
+    """Fetch URL content with retry logic. Uses requests library to avoid TLS fingerprint blocking."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://news.ycombinator.com/",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        "Cookie": "_sso.key=rTBXDtrhzGBTj5uOpzz-spu10sEculSJ; user=Jason_hu&MkuGBmxKMrZzGjv3EyMqXKdNS5qItnME",
     }
-    req = urllib.request.Request(url, headers=headers)
     for attempt in range(retries):
         try:
             if attempt > 0:
-                time.sleep(2 ** attempt)
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                return response.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as e:
-            if e.code == 403 and attempt < retries - 1:
+                wait_time = 2 ** attempt  # 2, 4, 8, 16 seconds
+                print(f"  Retry {attempt}/{retries-1} after {wait_time}s...")
+                time.sleep(wait_time)
+            response = requests.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            return response.text
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 403 and attempt < retries - 1:
+                print(f"  Got 403, will retry...")
                 continue
             raise
     raise Exception(f"Failed to fetch {url} after {retries} retries")
@@ -321,15 +337,16 @@ def clean_html_to_text(text: str) -> str:
 
 PROMPT_TEMPLATE = """The following is an article that appeared on Hacker News 10 years ago, and the discussion thread.
 
-Let's use our benefit of hindsight now:
+Let's use our benefit of hindsight now in 6 sections:
 
-1. What ended up happening to this topic? (research the topic briefly and write a summary)
-2. Give out awards for "Most prescient" and "Most wrong" comments, considering what happened.
-3. Mention any other fun or notable aspects of the article or discussion.
-4. Give out grades to specific people for their comments, considering what happened.
-5. At the end, give a final score (from 0-10) for how interesting this article and its retrospect analysis was.
+1. Give a brief summary of the article and the discussion thread.
+2. What ended up happening to this topic? (research the topic briefly and write a summary)
+3. Give out awards for "Most prescient" and "Most wrong" comments, considering what happened.
+4. Mention any other fun or notable aspects of the article or discussion.
+5. Give out grades to specific people for their comments, considering what happened.
+6. At the end, give a final score (from 0-10) for how interesting this article and its retrospect analysis was.
 
-As for the format of (4), use the header "Final grades" and follow it with simply an unordered list of people and their grades in the format of "name: grade (optional comment)". Here is an example:
+As for the format of Section 5, use the header "Final grades" and follow it with simply an unordered list of people and their grades in the format of "name: grade (optional comment)". Here is an example:
 
 Final grades
 - speckx: A+ (excellent predictions on ...)
@@ -340,7 +357,9 @@ Final grades
 
 Your list may contain more people of course than just this toy example. Please follow the format exactly because I will be parsing it programmatically. The idea is that I will accumulate the grades for each account to identify the accounts that were over long periods of time the most prescient or the most wrong.
 
-As for the format of (5), use the prefix "Article hindsight analysis interestingness score:" and then the score (0-10) as a number. Here is an example:
+As for the format of Section 6, use the prefix "Article hindsight analysis interestingness score:" and then the score (0-10) as a number. Give high scores to articles/discussions that are prominent, notable, or interesting in retrospect. Give low scores in cases where few predictions are made, or the topic is very niche or obscure, or the discussion is not very interesting in retrospect.
+
+Here is an example:
 Article hindsight analysis interestingness score: 8
 
 ---
@@ -397,16 +416,23 @@ def generate_prompt(article: Article, article_text: str, article_error: str | No
 # Grade parsing
 # -----------------------------------------------------------------------------
 
-def parse_grades(text: str) -> dict[str, str]:
-    """Parse the Final grades section from LLM output."""
+def parse_grades(text: str) -> dict[str, dict]:
+    """Parse the Final grades section from LLM output.
+
+    Returns dict of username -> {"grade": "A", "rationale": "explanation..."}
+    """
     grades = {}
-    pattern = r'(?:^|\n)(?:#+ *)?Final grades\s*\n'
+    # Match "Final grades" with optional leading section number, #, or other prefixes
+    pattern = r'(?:^|\n)(?:\d+[\.\)]\s*)?(?:#+ *)?Final grades\s*\n'
     match = re.search(pattern, text, re.IGNORECASE)
     if not match:
         return grades
 
     grades_section = text[match.end():]
-    line_pattern = r'^[\-\*]\s*([^:]+):\s*([A-F][+-]?)'
+    # Pattern: - username: GRADE (rationale text)
+    # Also handle: - username (qualifier): GRADE (rationale)
+    # Note: handle both ASCII +/- and Unicode minus (−)
+    line_pattern = r'^[\-\*]\s*([^:]+):\s*([A-F][+\-−]?)(?:\s*\(([^)]+)\))?'
 
     for line in grades_section.split('\n'):
         line = line.strip()
@@ -416,7 +442,10 @@ def parse_grades(text: str) -> dict[str, str]:
             break
         m = re.match(line_pattern, line)
         if m:
-            grades[m.group(1).strip()] = m.group(2).strip()
+            username = m.group(1).strip()
+            grade = m.group(2).strip()
+            rationale = m.group(3).strip() if m.group(3) else ""
+            grades[username] = {"grade": grade, "rationale": rationale}
 
     return grades
 
@@ -430,7 +459,7 @@ def grade_to_numeric(grade: str) -> float:
     if len(grade) > 1:
         if grade[1] == '+':
             value += 0.3
-        elif grade[1] == '-':
+        elif grade[1] in '-−':  # ASCII minus and Unicode minus
             value -= 0.3
     return value
 
@@ -452,6 +481,14 @@ def parse_interestingness_score(text: str) -> int | None:
 def get_data_dir(target_date: str) -> Path:
     """Get the data directory for a given date."""
     return Path("data") / target_date
+
+
+def get_output_dir(target_date: str | None = None) -> Path:
+    """Get the output directory, optionally for a specific date."""
+    base = Path("output")
+    if target_date:
+        return base / target_date
+    return base
 
 
 def stage_fetch(target_date: str, limit: int | None = None):
@@ -561,15 +598,23 @@ def stage_prompt(target_date: str):
     print(f"\nPrompts generated in {data_dir}")
 
 
-def stage_analyze(target_date: str, model: str = "gpt-5.1"):
+def stage_analyze(target_date: str, model: str = "gpt-5.1", max_workers: int = 5):
     """Stage 3: Run LLM analysis on all prompts."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from dotenv import load_dotenv
-    from openai import OpenAI
+    # from openai import OpenAI
 
     load_dotenv()
-    client = OpenAI()
+    # client = OpenAI()
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("Error: OPENAI_API_KEY not found in environment variables.")
+        return
+
     data_dir = get_data_dir(target_date)
 
+    # Collect articles to analyze
+    to_analyze = []
     for article_dir in sorted(data_dir.iterdir()):
         if not article_dir.is_dir():
             continue
@@ -580,29 +625,70 @@ def stage_analyze(target_date: str, model: str = "gpt-5.1"):
         if not prompt_file.exists() or response_file.exists():
             continue
 
-        prompt = prompt_file.read_text()
-
         meta_file = article_dir / "meta.json"
         with open(meta_file) as f:
             article = Article(**json.load(f))
 
-        print(f"Analyzing {article.item_id}: {article.title[:50]}...")
+        to_analyze.append((article_dir, article, prompt_file.read_text()))
+
+    if not to_analyze:
+        print("No articles to analyze.")
+        return
+
+    print(f"Analyzing {len(to_analyze)} articles with {max_workers} workers...")
+
+    def analyze_one(item):
+        article_dir, article, prompt = item
+        response_file = article_dir / "response.md"
+        
+        url = "https://apis.iflow.cn/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "stream": False,
+            "max_tokens": 4096,
+            "temperature": 0.7,
+            "top_p": 0.7,
+            "top_k": 50,
+            "frequency_penalty": 0.5,
+            "n": 1,
+            "response_format": {"type": "text"}
+        }
 
         try:
-            response = client.responses.create(
-                model=model,
-                input=prompt,
-                reasoning={"effort": "medium"},
-                text={"verbosity": "medium"},
-            )
-            result = response.output_text
+            response = requests.post(url, json=payload, headers=headers, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            # Handle potential API response structure variations
+            if 'choices' in data and len(data['choices']) > 0:
+                result = data['choices'][0]['message']['content']
+            else:
+                return (article.item_id, article.title[:50], 0, f"Unexpected API response: {data}")
+
             with open(response_file, 'w') as f:
                 f.write(result)
-            print(f"  Done ({len(result)} chars)")
+            return (article.item_id, article.title[:50], len(result), None)
         except Exception as e:
-            print(f"  Error: {e}")
+            return (article.item_id, article.title[:50], 0, str(e))
 
-        time.sleep(1)  # Rate limiting
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(analyze_one, item): item for item in to_analyze}
+        for future in as_completed(futures):
+            item_id, title, chars, error = future.result()
+            if error:
+                print(f"  {item_id}: {title}... Error: {error}")
+            else:
+                print(f"  {item_id}: {title}... Done ({chars} chars)")
 
     print(f"\nAnalysis complete. Results in {data_dir}")
 
@@ -610,7 +696,7 @@ def stage_analyze(target_date: str, model: str = "gpt-5.1"):
 def stage_parse(target_date: str):
     """Stage 4: Parse grades from all responses."""
     data_dir = get_data_dir(target_date)
-    all_grades = {}  # username -> list of (grade, article_id)
+    all_grades = {}  # username -> list of {grade, rationale, article}
 
     for article_dir in sorted(data_dir.iterdir()):
         if not article_dir.is_dir():
@@ -624,7 +710,7 @@ def stage_parse(target_date: str):
             continue
 
         response = response_file.read_text()
-        grades = parse_grades(response)
+        grades = parse_grades(response)  # Now returns {username: {grade, rationale}}
         score = parse_interestingness_score(response)
 
         with open(grades_file, 'w') as f:
@@ -634,10 +720,14 @@ def stage_parse(target_date: str):
             json.dump({"interestingness": score}, f, indent=2)
 
         item_id = article_dir.name
-        for username, grade in grades.items():
+        for username, grade_info in grades.items():
             if username not in all_grades:
                 all_grades[username] = []
-            all_grades[username].append({"grade": grade, "article": item_id})
+            all_grades[username].append({
+                "grade": grade_info["grade"],
+                "rationale": grade_info["rationale"],
+                "article": item_id
+            })
 
         score_str = f", score={score}" if score is not None else ""
         print(f"Parsed {len(grades)} grades from {item_id}{score_str}")
@@ -663,72 +753,123 @@ def stage_parse(target_date: str):
             print(f"  {username}: {gpa:.2f} ({count} articles)")
 
 
-def stage_render(target_date: str):
-    """Stage 5: Render HTML summary."""
+def stage_clean(target_date: str, stage: str | None = None, article_id: str | None = None):
+    """Clean cached data for a date, optionally filtered by stage or article."""
     data_dir = get_data_dir(target_date)
+
+    if not data_dir.exists():
+        print(f"No data directory for {target_date}")
+        return
+
+    # Define what files each stage produces
+    stage_files = {
+        "fetch": ["meta.json", "article.txt", "article_error.txt", "comments.json"],
+        "prompt": ["prompt.md"],
+        "analyze": ["response.md"],
+        "parse": ["grades.json", "score.json"],
+    }
+
+    # Stages and their downstream dependencies
+    stage_order = ["fetch", "prompt", "analyze", "parse", "render"]
+
+    # Determine which stages to clean
+    if stage:
+        if stage not in stage_order:
+            print(f"Unknown stage: {stage}")
+            return
+        # Clean this stage and all downstream stages
+        stage_idx = stage_order.index(stage)
+        stages_to_clean = stage_order[stage_idx:-1]  # exclude render (it's just summary.html)
+    else:
+        stages_to_clean = stage_order[:-1]  # all except render
+
+    files_to_delete = set()
+    for s in stages_to_clean:
+        files_to_delete.update(stage_files.get(s, []))
+
+    # Get article directories to clean
+    if article_id:
+        article_dirs = [data_dir / article_id]
+        if not article_dirs[0].exists():
+            print(f"Article {article_id} not found")
+            return
+    else:
+        article_dirs = [d for d in data_dir.iterdir() if d.is_dir()]
+
+    # Clean files
+    deleted_count = 0
+    for article_dir in article_dirs:
+        for filename in files_to_delete:
+            filepath = article_dir / filename
+            if filepath.exists():
+                filepath.unlink()
+                deleted_count += 1
+
+        # If cleaning fetch, remove the entire article directory if empty
+        if "fetch" in stages_to_clean:
+            if article_dir.exists() and not any(article_dir.iterdir()):
+                article_dir.rmdir()
+
+    # Clean top-level files
+    if not article_id:
+        if "fetch" in stages_to_clean:
+            frontpage = data_dir / "frontpage.json"
+            if frontpage.exists():
+                frontpage.unlink()
+                deleted_count += 1
+
+        if "parse" in stages_to_clean:
+            all_grades = data_dir / "all_grades.json"
+            if all_grades.exists():
+                all_grades.unlink()
+                deleted_count += 1
+
+        # Always clean summary.html if cleaning any stage
+        summary = data_dir / "summary.html"
+        if summary.exists():
+            summary.unlink()
+            deleted_count += 1
+
+    stage_desc = f"stage '{stage}' and downstream" if stage else "all stages"
+    article_desc = f" for article {article_id}" if article_id else ""
+    print(f"Cleaned {stage_desc}{article_desc}: {deleted_count} files deleted")
+
+
+def get_all_output_dates() -> list[str]:
+    """Get all dates that have been rendered to output directory."""
+    output_base = get_output_dir()
+    if not output_base.exists():
+        return []
+    dates = []
+    for d in output_base.iterdir():
+        if d.is_dir() and (d / "index.html").exists():
+            dates.append(d.name)
+    return sorted(dates)
+
+
+def stage_render(target_date: str, update_index: bool = True):
+    """Stage 5: Render HTML summary to output directory."""
+    data_dir = get_data_dir(target_date)
+    output_dir = get_output_dir(target_date)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load frontpage
     frontpage_file = data_dir / "frontpage.json"
     with open(frontpage_file) as f:
         articles = [Article(**a) for a in json.load(f)]
 
-    html_parts = [f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>HN Time Capsule - {target_date}</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-               max-width: 900px; margin: 0 auto; padding: 20px; line-height: 1.6; }}
-        h1 {{ color: #ff6600; }}
-        h2 {{ border-bottom: 1px solid #eee; padding-bottom: 10px; }}
-        .article {{ margin-bottom: 40px; padding: 20px; background: #f9f9f9; border-radius: 8px; }}
-        .article-title {{ font-size: 1.3em; margin-bottom: 10px; }}
-        .article-title a {{ color: #000; text-decoration: none; }}
-        .article-title a:hover {{ text-decoration: underline; }}
-        .meta {{ color: #666; font-size: 0.9em; margin-bottom: 15px; }}
-        .grades {{ background: #fff; padding: 15px; border-radius: 4px; margin-top: 15px; }}
-        .grade {{ display: inline-block; padding: 2px 8px; margin: 2px; border-radius: 3px; font-size: 0.85em; }}
-        .grade-a {{ background: #c6efce; color: #006100; }}
-        .grade-b {{ background: #ffeb9c; color: #9c5700; }}
-        .grade-c {{ background: #ffc7ce; color: #9c0006; }}
-        .grade-d, .grade-f {{ background: #f4cccc; color: #990000; }}
-        .response {{ white-space: pre-wrap; font-size: 0.9em; background: #fff;
-                    padding: 15px; border-radius: 4px; max-height: 500px; overflow-y: auto; }}
-        details {{ margin-top: 10px; }}
-        summary {{ cursor: pointer; color: #0066cc; }}
-        .score {{ display: inline-block; padding: 3px 10px; border-radius: 12px; font-weight: bold; font-size: 0.85em; margin-left: 10px; }}
-        .score-high {{ background: #ff6600; color: white; }}
-        .score-medium {{ background: #ffcc00; color: #333; }}
-        .score-low {{ background: #ddd; color: #666; }}
-    </style>
-</head>
-<body>
-    <h1>🕰️ HN Time Capsule</h1>
-    <h2>{target_date} (10 years ago)</h2>
-"""]
-
+    # Collect all article data
+    articles_data = []
     for article in articles:
         article_dir = data_dir / article.item_id
 
-        # Load grades if available
-        grades_file = article_dir / "grades.json"
-        grades = {}
-        if grades_file.exists():
-            with open(grades_file) as f:
-                grades = json.load(f)
-
         # Load response if available
         response_file = article_dir / "response.md"
-        response = ""
-        if response_file.exists():
-            response = response_file.read_text()
+        response = response_file.read_text() if response_file.exists() else ""
 
         # Load prompt if available
         prompt_file = article_dir / "prompt.md"
-        prompt = ""
-        if prompt_file.exists():
-            prompt = prompt_file.read_text()
+        prompt = prompt_file.read_text() if prompt_file.exists() else ""
 
         # Load interestingness score if available
         score_file = article_dir / "score.json"
@@ -738,48 +879,948 @@ def stage_render(target_date: str):
                 score_data = json.load(f)
                 score = score_data.get("interestingness")
 
-        # Grade badges
+        # Load grades if available
+        grades_file = article_dir / "grades.json"
+        grades = {}
+        if grades_file.exists():
+            with open(grades_file) as f:
+                grades = json.load(f)
+
+        articles_data.append({
+            "article": article,
+            "response": response,
+            "prompt": prompt,
+            "score": score,
+            "grades": grades,
+        })
+
+    # Get all dates for navigation
+    all_dates = get_all_output_dates()
+    # Add current date if not yet in list (we're about to render it)
+    if target_date not in all_dates:
+        all_dates = sorted(all_dates + [target_date])
+    current_idx = all_dates.index(target_date)
+    prev_date = all_dates[current_idx - 1] if current_idx > 0 else None
+    next_date = all_dates[current_idx + 1] if current_idx < len(all_dates) - 1 else None
+
+    # Build HTML
+    html_parts = [f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>HN Time Capsule - {target_date}</title>
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               margin: 0; padding: 0; line-height: 1.6; height: 100vh; overflow: hidden; }}
+        .container {{ display: flex; height: 100vh; }}
+
+        /* Sidebar */
+        .sidebar {{ width: 350px; min-width: 350px; background: #f5f5f5; border-right: 1px solid #ddd;
+                   overflow-y: auto; padding: 15px; }}
+        .sidebar h1 {{ color: #ff6600; font-size: 1.3em; margin: 0 0 5px 0; }}
+        .sidebar h1 a {{ color: #ff6600; text-decoration: none; }}
+        .sidebar h1 a:hover {{ text-decoration: underline; }}
+        .sidebar h2 {{ font-size: 0.95em; color: #666; margin: 0 0 8px 0; font-weight: normal; }}
+        .nav {{ display: flex; gap: 10px; margin-bottom: 15px; font-size: 0.85em; }}
+        .nav a {{ color: #0066cc; text-decoration: none; }}
+        .nav a:hover {{ text-decoration: underline; }}
+        .nav .disabled {{ color: #ccc; }}
+        .article-item {{ padding: 10px; margin-bottom: 8px; background: #fff; border-radius: 6px;
+                        cursor: pointer; border: 2px solid transparent; transition: all 0.15s;
+                        display: flex; align-items: flex-start; gap: 10px; }}
+        .article-item:hover {{ border-color: #ff6600; }}
+        .article-item.selected {{ border-color: #ff6600; background: #fff5f0; }}
+        .article-item .score-box {{ width: 36px; height: 36px; border-radius: 6px; display: flex;
+                                   align-items: center; justify-content: center; font-weight: bold;
+                                   font-size: 0.85em; flex-shrink: 0; }}
+        .article-item .score-box.score-10 {{ background: #c2410c; color: white; }}
+        .article-item .score-box.score-9 {{ background: #ea580c; color: white; }}
+        .article-item .score-box.score-8 {{ background: #f97316; color: white; }}
+        .article-item .score-box.score-7 {{ background: #fb923c; color: #333; }}
+        .article-item .score-box.score-6 {{ background: #fdba74; color: #333; }}
+        .article-item .score-box.score-5 {{ background: #fed7aa; color: #333; }}
+        .article-item .score-box.score-4 {{ background: #e5e7eb; color: #666; }}
+        .article-item .score-box.score-3 {{ background: #d1d5db; color: #666; }}
+        .article-item .score-box.score-2 {{ background: #9ca3af; color: white; }}
+        .article-item .score-box.score-1 {{ background: #6b7280; color: white; }}
+        .article-item .score-box.score-0 {{ background: #4b5563; color: white; }}
+        .article-item .score-box.score-none {{ background: #eee; color: #999; font-size: 0.7em; }}
+        .article-item .content {{ flex: 1; min-width: 0; }}
+        .article-item .title {{ font-size: 0.9em; font-weight: 500; margin-bottom: 4px; color: #333; }}
+        .article-item .meta {{ font-size: 0.75em; color: #888; }}
+        .score {{ display: inline-block; padding: 2px 6px; border-radius: 10px; font-weight: bold;
+                 font-size: 0.7em; margin-left: 6px; vertical-align: middle; }}
+        .score.score-10 {{ background: #c2410c; color: white; }}
+        .score.score-9 {{ background: #ea580c; color: white; }}
+        .score.score-8 {{ background: #f97316; color: white; }}
+        .score.score-7 {{ background: #fb923c; color: #333; }}
+        .score.score-6 {{ background: #fdba74; color: #333; }}
+        .score.score-5 {{ background: #fed7aa; color: #333; }}
+        .score.score-4 {{ background: #e5e7eb; color: #666; }}
+        .score.score-3 {{ background: #d1d5db; color: #666; }}
+        .score.score-2 {{ background: #9ca3af; color: white; }}
+        .score.score-1 {{ background: #6b7280; color: white; }}
+        .score.score-0 {{ background: #4b5563; color: white; }}
+
+        /* Main content */
+        .main {{ flex: 1; overflow-y: auto; padding: 30px 40px; background: #fff; }}
+        .main-inner {{ max-width: 800px; }}
+        .main h1 {{ margin-top: 0; font-size: 1.5em; color: #333; }}
+        .main .article-meta {{ color: #666; font-size: 0.9em; margin-bottom: 20px; padding-bottom: 15px;
+                              border-bottom: 1px solid #eee; }}
+        .main .article-meta a {{ color: #0066cc; }}
+        .analysis {{ font-size: 0.95em; line-height: 1.5; }}
+        .grades-section {{ background: #f9f9f9; padding: 15px; border-radius: 6px; margin-top: 20px; }}
+        .grade {{ display: inline-block; padding: 2px 8px; margin: 2px; border-radius: 3px; font-size: 0.8em; }}
+        .grade-a {{ background: #c6efce; color: #006100; }}
+        .grade-b {{ background: #ffeb9c; color: #9c5700; }}
+        .grade-c {{ background: #ffc7ce; color: #9c0006; }}
+        .grade-d, .grade-f {{ background: #f4cccc; color: #990000; }}
+        .prompt-section {{ margin-top: 20px; }}
+        .prompt-section summary {{ cursor: pointer; color: #0066cc; font-size: 0.9em; }}
+        .prompt-content {{ white-space: pre-wrap; font-size: 0.85em; background: #f5f5f5;
+                          padding: 15px; border-radius: 4px; margin-top: 10px; max-height: 400px; overflow-y: auto; }}
+        .placeholder {{ color: #999; text-align: center; margin-top: 100px; }}
+
+        /* Markdown content styling */
+        .analysis h1, .analysis h2, .analysis h3 {{ margin-top: 1.2em; margin-bottom: 0.4em; color: #333; }}
+        .analysis h1 {{ font-size: 1.3em; border-bottom: 1px solid #eee; padding-bottom: 0.3em; }}
+        .analysis h2 {{ font-size: 1.15em; }}
+        .analysis h3 {{ font-size: 1.05em; }}
+        .analysis p {{ margin: 0.6em 0; }}
+        .analysis ul, .analysis ol {{ margin: 0.6em 0; padding-left: 1.5em; }}
+        .analysis li {{ margin: 0.25em 0; }}
+        .analysis strong {{ color: #333; }}
+        .analysis blockquote {{ border-left: 3px solid #ff6600; margin: 0.8em 0; padding-left: 1em; color: #555; }}
+        .analysis code {{ background: #f5f5f5; padding: 0.15em 0.4em; border-radius: 3px; font-size: 0.9em; }}
+        .analysis pre {{ background: #f5f5f5; padding: 0.8em; border-radius: 4px; overflow-x: auto; margin: 0.6em 0; }}
+        .analysis pre code {{ background: none; padding: 0; }}
+        .analysis hr {{ border: none; border-top: 1px solid #eee; margin: 1em 0; }}
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <h1><a href="../index.html">HN Time Capsule</a></h1>
+            <h2>{target_date} (10 years ago)</h2>
+            <div class="nav">
+                {f'<a href="../{prev_date}/index.html">&larr; {prev_date}</a>' if prev_date else '<span class="disabled">&larr; prev</span>'}
+                <span>|</span>
+                {f'<a href="../{next_date}/index.html">{next_date} &rarr;</a>' if next_date else '<span class="disabled">next &rarr;</span>'}
+            </div>
+"""]
+
+    # Sidebar items
+    for i, data in enumerate(articles_data):
+        article = data["article"]
+        score = data["score"]
+        if score is not None:
+            score_class = f"score-{score}"
+            score_box = f'<div class="score-box {score_class}">{score}</div>'
+        else:
+            score_box = '<div class="score-box score-none">--</div>'
+
+        selected = "selected" if i == 0 else ""
+        html_parts.append(f"""
+            <div class="article-item {selected}" id="article-{article.item_id}" onclick="selectArticle({i})">
+                {score_box}
+                <div class="content">
+                    <div class="title">{article.rank}. {html.escape(article.title)}</div>
+                    <div class="meta">{article.points} pts &middot; {article.comment_count} comments</div>
+                </div>
+            </div>""")
+
+    html_parts.append("""
+        </div>
+        <div class="main">
+            <div class="main-inner" id="main-content">
+                <div class="placeholder">Select an article from the sidebar</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    // Configure marked for tighter output
+    marked.setOptions({ breaks: false, gfm: true });
+
+    // Preprocess markdown to remove excessive whitespace
+    function cleanMarkdown(md) {
+        return md
+            .replace(/  +$/gm, '')
+            .replace(/\\n\\n\\n+/g, '\\n\\n');
+    }
+
+    const articles = [""")
+
+    # JavaScript data
+    for i, data in enumerate(articles_data):
+        article = data["article"]
+        response = data["response"]
+        prompt = data["prompt"]
+        grades = data["grades"]
+        score = data["score"]
+
+        # Build grades HTML
         grade_html = ""
         if grades:
-            sorted_grades = sorted(grades.items(), key=lambda x: grade_to_numeric(x[1]), reverse=True)
-            for username, grade in sorted_grades[:15]:  # Top 15
+            # Handle both old format (username: "grade") and new format (username: {grade, rationale})
+            def get_grade(item):
+                val = item[1]
+                if isinstance(val, dict):
+                    return val.get("grade", "")
+                return val
+            sorted_grades = sorted(grades.items(), key=lambda x: -grade_to_numeric(get_grade(x)))
+            for username, grade_info in sorted_grades[:20]:
+                grade = get_grade((username, grade_info))
+                if not grade:
+                    continue
                 grade_class = f"grade-{grade[0].lower()}"
-                grade_html += f'<span class="grade {grade_class}">{username}: {grade}</span> '
+                grade_html += f'<span class="grade {grade_class}">{html.escape(username)}: {grade}</span> '
 
-        # Score badge
-        score_html = ""
-        if score is not None:
-            if score >= 7:
-                score_class = "score-high"
-            elif score >= 4:
-                score_class = "score-medium"
-            else:
-                score_class = "score-low"
-            score_html = f'<span class="score {score_class}">{score}/10</span>'
+        # Escape for JS
+        title_js = json.dumps(article.title)
+        url_js = json.dumps(article.url)
+        hn_url_js = json.dumps(article.hn_url)
+        response_js = json.dumps(html.escape(response))
+        prompt_js = json.dumps(html.escape(prompt))
+        grade_html_js = json.dumps(grade_html)
 
         html_parts.append(f"""
-    <div class="article">
-        <div class="article-title">
-            {article.rank}. <a href="{article.url}" target="_blank">{html.escape(article.title)}</a>{score_html}
-        </div>
-        <div class="meta">
-            {article.points} points | {article.comment_count} comments |
-            <a href="{article.url}" target="_blank">Original Article</a> |
-            <a href="{article.hn_url}" target="_blank">HN Discussion</a>
-        </div>
-        {"<div class='grades'><strong>Grades:</strong> " + grade_html + "</div>" if grade_html else ""}
-        {"<details><summary>View LLM prompt</summary><div class='response'>" + html.escape(prompt) + "</div></details>" if prompt else ""}
-        {"<details><summary>View full analysis</summary><div class='response'>" + html.escape(response) + "</div></details>" if response else ""}
-    </div>
-""")
+        {{
+            id: "{article.item_id}",
+            title: {title_js},
+            url: {url_js},
+            hn_url: {hn_url_js},
+            points: {article.points},
+            comments: {article.comment_count},
+            score: {json.dumps(score)},
+            response: {response_js},
+            prompt: {prompt_js},
+            grades: {grade_html_js}
+        }},""")
 
-    html_parts.append("</body></html>")
+    html_parts.append("""
+    ];
 
-    output_file = data_dir / "summary.html"
+    function selectArticle(idx, updateHash = true) {
+        // Update sidebar selection
+        document.querySelectorAll('.article-item').forEach((el, i) => {
+            el.classList.toggle('selected', i === idx);
+        });
+
+        const a = articles[idx];
+        const scoreHtml = a.score !== null ?
+            `<span class="score score-${a.score}">${a.score}/10</span>` : '';
+
+        document.getElementById('main-content').innerHTML = `
+            <h1>${a.title}${scoreHtml}</h1>
+            <div class="article-meta">
+                ${a.points} points &middot; ${a.comments} comments &middot;
+                <a href="${a.url}" target="_blank">Original Article</a> &middot;
+                <a href="${a.hn_url}" target="_blank">HN Discussion</a>
+            </div>
+            ${a.grades ? `<div class="grades-section"><strong>Grades:</strong> ${a.grades}</div>` : ''}
+            <div class="analysis">${a.response ? marked.parse(cleanMarkdown(a.response)) : '<em>No analysis available</em>'}</div>
+            ${a.prompt ? `<details class="prompt-section"><summary>View LLM prompt</summary><div class="prompt-content">${a.prompt}</div></details>` : ''}
+        `;
+
+        // Update URL hash without scrolling
+        if (updateHash) {
+            history.replaceState(null, '', '#article-' + a.id);
+        }
+    }
+
+    function selectArticleById(id) {
+        const idx = articles.findIndex(a => a.id === id);
+        if (idx >= 0) {
+            selectArticle(idx, false);
+            // Scroll sidebar item into view
+            document.getElementById('article-' + id)?.scrollIntoView({block: 'nearest'});
+        }
+    }
+
+    // Handle initial load and hash changes
+    function handleHash() {
+        const hash = window.location.hash;
+        if (hash.startsWith('#article-')) {
+            const id = hash.substring(9);  // Remove '#article-'
+            selectArticleById(id);
+            return true;
+        }
+        return false;
+    }
+
+    // On load: check for hash, otherwise select first
+    if (!handleHash() && articles.length > 0) {
+        selectArticle(0);
+    }
+
+    // Handle hash changes (e.g., back/forward navigation)
+    window.addEventListener('hashchange', handleHash);
+    </script>
+</body>
+</html>""")
+
+    output_file = output_dir / "index.html"
     with open(output_file, 'w') as f:
         f.write("\n".join(html_parts))
 
     print(f"Rendered HTML to {output_file}")
+
+    if update_index:
+        stage_render_index()
+
+
+def stage_render_index():
+    """Render the main index page and re-render all day pages to update navigation."""
+    output_base = get_output_dir()
+    output_base.mkdir(parents=True, exist_ok=True)
+
+    # Find all dates that have data (not just output)
+    data_base = Path("data")
+    all_dates = []
+    if data_base.exists():
+        for d in data_base.iterdir():
+            if d.is_dir() and (d / "frontpage.json").exists():
+                all_dates.append(d.name)
+    all_dates = sorted(all_dates)
+
+    if not all_dates:
+        print("No dates to index.")
+        return
+
+    # Re-render all day pages to update prev/next navigation
+    print(f"Re-rendering {len(all_dates)} day pages...")
+    for d in all_dates:
+        stage_render(d, update_index=False)
+
+    html = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>HN Time Capsule</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               max-width: 800px; margin: 0 auto; padding: 40px 20px; line-height: 1.6; }
+        h1 { color: #ff6600; }
+        .intro { color: #666; margin-bottom: 30px; }
+        .hall-of-fame-link { display: inline-block; margin-bottom: 30px; padding: 12px 24px;
+                            background: linear-gradient(135deg, #fbbf24, #f59e0b); color: white;
+                            text-decoration: none; border-radius: 8px; font-weight: 600;
+                            transition: transform 0.15s, box-shadow 0.15s; }
+        .hall-of-fame-link:hover { box-shadow: 0 4px 12px rgba(251, 191, 36, 0.4); }
+        h2 { color: #333; margin-top: 40px; margin-bottom: 20px; font-size: 1.2em; }
+        .date-list { list-style: none; padding: 0; }
+        .date-list li { margin-bottom: 10px; }
+        .date-list a { display: block; padding: 15px 20px; background: #f5f5f5; border-radius: 6px;
+                      text-decoration: none; color: #333; transition: all 0.15s; }
+        .date-list a:hover { background: #ff6600; color: white; }
+        .date-list .date { font-weight: 500; }
+        .date-list .desc { font-size: 0.85em; color: #888; margin-top: 3px; }
+        .date-list a:hover .desc { color: rgba(255,255,255,0.8); }
+    </style>
+</head>
+<body>
+    <h1>HN Time Capsule</h1>
+    <p class="intro">
+        LLMs revisit Hacker News frontpages from 10 years ago (December 2015), with the benefit of hindsight.
+        Each day's articles and comments are analyzed by ChatGPT 5.1 (with thinking + browser tool) to compare what was said to what actually happened and users are graded on how prescient they were in retrospect. 30 articles per front page and 31 of them => 930 GPT 5.1 Thinking calls led to total cost of ~$60.
+    </p>
+    <h2>Browse by User</h2>
+    <a href="hall-of-fame.html" class="hall-of-fame-link">Hall of Fame</a>
+    
+    <h2>Discover</h2>
+    <a href="recommend.html" class="hall-of-fame-link" style="background: linear-gradient(135deg, #ec4899, #8b5cf6);">Discover & Recommend</a>
+
+    <h2>Browse by Date</h2>
+    <ul class="date-list">
+"""
+
+    for d in reversed(all_dates):  # Most recent first
+        html += f"""        <li>
+            <a href="{d}/index.html">
+                <div class="date">{d}</div>
+                <div class="desc">10 years ago today</div>
+            </a>
+        </li>
+"""
+
+    html += """    </ul>
+</body>
+</html>"""
+
+    output_file = output_base / "index.html"
+    with open(output_file, 'w') as f:
+        f.write(html)
+
+    print(f"Rendered index to {output_file} ({len(all_dates)} dates)")
+
+    # Also render the Hall of Fame
+    stage_render_hall_of_fame()
+
+
+def stage_render_hall_of_fame():
+    """Render the Hall of Fame page aggregating all user grades across all dates."""
+    output_base = get_output_dir()
+    data_base = Path("data")
+
+    # Collect all grades from all dates
+    all_user_grades = {}  # username -> list of {grade, rationale, article, date, article_title, hn_url}
+
+    if not data_base.exists():
+        print("No data directory found.")
+        return
+
+    for date_dir in sorted(data_base.iterdir()):
+        if not date_dir.is_dir():
+            continue
+
+        frontpage_file = date_dir / "frontpage.json"
+        all_grades_file = date_dir / "all_grades.json"
+
+        if not all_grades_file.exists():
+            continue
+
+        # Load frontpage for article titles
+        article_info = {}
+        if frontpage_file.exists():
+            with open(frontpage_file) as f:
+                for article in json.load(f):
+                    article_info[article["item_id"]] = {
+                        "title": article["title"],
+                        "hn_url": article["hn_url"]
+                    }
+
+        # Load grades
+        with open(all_grades_file) as f:
+            grades_data = json.load(f)
+
+        target_date = date_dir.name
+        for username, grade_list in grades_data.items():
+            if username not in all_user_grades:
+                all_user_grades[username] = []
+
+            for g in grade_list:
+                article_id = g["article"]
+                info = article_info.get(article_id, {})
+                all_user_grades[username].append({
+                    "grade": g["grade"],
+                    "rationale": g.get("rationale", ""),
+                    "article_id": article_id,
+                    "date": target_date,
+                    "article_title": info.get("title", f"Article {article_id}"),
+                    "hn_url": info.get("hn_url", f"https://news.ycombinator.com/item?id={article_id}")
+                })
+
+    if not all_user_grades:
+        print("No grades found to render.")
+        return
+
+    # Calculate stats for each user
+    user_stats = []
+    all_gpas = []  # Collect all GPAs for global mean
+    for username, grades in all_user_grades.items():
+        gpas = [grade_to_numeric(g["grade"]) for g in grades]
+        all_gpas.extend(gpas)
+        avg_gpa = sum(gpas) / len(gpas)
+        user_stats.append({
+            "username": username,
+            "avg_gpa": avg_gpa,
+            "num_grades": len(grades),
+            "grades": grades
+        })
+
+    # Filter to users with at least 3 grades
+    user_stats = [u for u in user_stats if u["num_grades"] >= 3]
+
+    # Bayesian weighted rating (IMDB formula)
+    # weighted = (v * R + m * C) / (v + m)
+    # v = number of votes, R = user's average, m = prior weight, C = global mean
+    global_mean = sum(all_gpas) / len(all_gpas) if all_gpas else 3.0
+    m = 3  # Prior weight - effectively adds 3 "average" votes to each user
+
+    for u in user_stats:
+        v = u["num_grades"]
+        R = u["avg_gpa"]
+        u["weighted_gpa"] = (v * R + m * global_mean) / (v + m)
+
+    # Sort by weighted GPA (highest first)
+    user_stats.sort(key=lambda x: -x["weighted_gpa"])
+
+    # Generate HTML
+    def grade_color(grade: str) -> str:
+        """Return background color for a grade with +/- variations."""
+        # Color mapping: each grade has base, plus, minus variants
+        colors = {
+            'A+': '#15803d',  # dark green
+            'A':  '#22c55e',  # green
+            'A-': '#4ade80',  # light green
+            'A−': '#4ade80',  # light green (unicode minus)
+            'B+': '#1d4ed8',  # dark blue
+            'B':  '#3b82f6',  # blue
+            'B-': '#60a5fa',  # light blue
+            'B−': '#60a5fa',  # light blue (unicode minus)
+            'C+': '#d97706',  # dark amber
+            'C':  '#f59e0b',  # amber
+            'C-': '#fbbf24',  # light amber
+            'C−': '#fbbf24',  # light amber (unicode minus)
+            'D+': '#ea580c',  # dark orange
+            'D':  '#f97316',  # orange
+            'D-': '#fb923c',  # light orange
+            'D−': '#fb923c',  # light orange (unicode minus)
+            'F':  '#ef4444',  # red
+        }
+        return colors.get(grade, '#6b7280')  # gray fallback
+
+    page_html = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Hall of Fame - HN Time Capsule</title>
+    <style>
+        *{box-sizing:border-box}
+        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:1000px;margin:0 auto;padding:40px 20px;line-height:1.6}
+        h1{color:#ff6600}
+        .i{color:#666;margin-bottom:30px}
+        .b{margin-bottom:20px}
+        .b a{color:#ff6600;text-decoration:none}
+        .b a:hover{text-decoration:underline}
+        .uc{background:#f9fafb;border-radius:8px;padding:20px;margin-bottom:20px;border:1px solid #e5e7eb}
+        .uh{display:flex;align-items:center;gap:15px;margin-bottom:15px}
+        .un{font-size:1.25em;font-weight:600}
+        .un a{color:#333;text-decoration:none}
+        .un a:hover{color:#ff6600}
+        .us{color:#666;font-size:0.9em}
+        .ag{background:#ff6600;color:white;padding:4px 10px;border-radius:4px;font-weight:600;font-size:0.9em}
+        .gl{display:flex;flex-direction:column;gap:10px}
+        .gi{display:flex;align-items:flex-start;gap:12px;padding:10px;background:white;border-radius:6px;border:1px solid #e5e7eb}
+        .gb{min-width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:white;font-weight:700;font-size:0.85em}
+        .gc{flex:1}
+        .ga{font-weight:500;margin-bottom:4px}
+        .ga a{color:#333;text-decoration:none}
+        .ga a:hover{color:#ff6600}
+        .gr{color:#666;font-size:0.9em;font-style:italic}
+        .gm{font-size:0.8em;color:#999;margin-top:4px}
+        .gm a{color:#ff6600;text-decoration:none}
+        .gm a:hover{text-decoration:underline}
+        .rk{font-size:1.5em;font-weight:700;color:#d1d5db;min-width:40px}
+        .rk.g{color:#fbbf24}
+        .rk.s{color:#9ca3af}
+        .rk.z{color:#d97706}
+    </style>
+</head>
+<body>
+    <div class="b"><a href="index.html">&larr; Back to dates</a></div>
+    <h1>Hall of Fame</h1>
+    <p class="i">
+        The most prescient Hacker News commenters, ranked by their average grade across all analyzed threads.
+        Grades are assigned by an LLM evaluating how well each comment predicted the future with 10 years of hindsight.
+    </p>
+"""
+
+    for i, user in enumerate(user_stats):
+        rank = i + 1
+        rank_class = ""
+        if rank == 1:
+            rank_class = "g"
+        elif rank == 2:
+            rank_class = "s"
+        elif rank == 3:
+            rank_class = "z"
+
+        # Format GPA as letter grade equivalent (use weighted GPA for ranking/display)
+        gpa = user["weighted_gpa"]
+        if gpa >= 3.85:
+            gpa_letter = "A"
+        elif gpa >= 3.5:
+            gpa_letter = "A-"
+        elif gpa >= 3.15:
+            gpa_letter = "B+"
+        elif gpa >= 2.85:
+            gpa_letter = "B"
+        elif gpa >= 2.5:
+            gpa_letter = "B-"
+        elif gpa >= 2.15:
+            gpa_letter = "C+"
+        elif gpa >= 1.85:
+            gpa_letter = "C"
+        elif gpa >= 1.5:
+            gpa_letter = "C-"
+        elif gpa >= 1.15:
+            gpa_letter = "D+"
+        elif gpa >= 0.85:
+            gpa_letter = "D"
+        else:
+            gpa_letter = "F"
+
+        hn_user_url = f"https://news.ycombinator.com/user?id={html.escape(user['username'])}"
+
+        page_html += f"""<div class="uc"><div class="uh"><div class="rk {rank_class}">#{rank}</div><div class="un"><a href="{hn_user_url}" target="_blank">{html.escape(user['username'])}</a></div><div class="ag">{gpa_letter} ({gpa:.2f})</div><div class="us">{user['num_grades']} grade{"s" if user['num_grades'] > 1 else ""}</div></div><div class="gl">"""
+
+        # Sort grades by grade (best first)
+        sorted_grades = sorted(user["grades"], key=lambda g: -grade_to_numeric(g["grade"]))
+
+        for g in sorted_grades:
+            color = grade_color(g["grade"])
+            rationale_part = f'<div class="gr">"{html.escape(g["rationale"])}"</div>' if g["rationale"] else ""
+            analysis_url = f"{g['date']}/index.html#article-{g['article_id']}"
+
+            page_html += f"""<div class="gi"><div class="gb" style="background:{color}">{g['grade']}</div><div class="gc"><div class="ga"><a href="{analysis_url}">{html.escape(g['article_title'])}</a></div>{rationale_part}<div class="gm"><a href="{analysis_url}">View</a> &middot; <a href="{g['hn_url']}" target="_blank">HN</a> &middot; {g['date']}</div></div></div>"""
+
+        page_html += """</div></div>
+"""
+
+    page_html += """</body>
+</html>"""
+
+    output_file = output_base / "hall-of-fame.html"
+    with open(output_file, 'w') as f:
+        f.write(page_html)
+
+    print(f"Rendered Hall of Fame to {output_file} ({len(user_stats)} users)")
+
+
+def stage_render_recommend():
+    """Render the recommendation page with interactive cards."""
+    output_base = get_output_dir()
+    data_base = Path("data")
+
+    # Collect all articles
+    all_articles = []
+    if data_base.exists():
+        for date_dir in sorted(data_base.iterdir()):
+            if not date_dir.is_dir(): continue
+            
+            # Read articles from meta files
+            for article_dir in date_dir.iterdir():
+                if not article_dir.is_dir(): continue
+                
+                meta_file = article_dir / "meta.json"
+                score_file = article_dir / "score.json"
+                
+                if not meta_file.exists(): continue
+                
+                with open(meta_file) as f:
+                    meta = json.load(f)
+                
+                score = 0
+                if score_file.exists():
+                    try:
+                        with open(score_file) as f:
+                            score = json.load(f).get("interestingness", 0)
+                    except: pass
+                
+                # Add date info and flatten structure for JS
+                article_data = {
+                    "id": meta.get("item_id"),
+                    "title": meta.get("title"),
+                    "points": meta.get("points", 0),
+                    "comments": meta.get("comment_count", 0),
+                    "score": score,
+                    "date": date_dir.name,
+                    "url": meta.get("url"),
+                    "hn_url": meta.get("hn_url")
+                }
+                all_articles.append(article_data)
+
+    if not all_articles:
+        print("No articles found for recommendation page.")
+        return
+
+    # HTML Template
+    html = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Discover - HN Time Capsule</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        :root {
+            --bg: #121212;
+            --card-bg: #1e1e1e;
+            --text-primary: #ffffff;
+            --text-secondary: #b3b3b3;
+            --accent: #ff6600;
+        }
+        * { box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text-primary);
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #333;
+        }
+        h1 { margin: 0; font-size: 1.5rem; color: var(--accent); }
+        a { color: var(--text-primary); text-decoration: none; }
+        .back-link { font-size: 0.9rem; color: var(--text-secondary); }
+        .back-link:hover { color: var(--accent); }
+        
+        .tabs {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 30px;
+            overflow-x: auto;
+            padding-bottom: 5px;
+            -webkit-overflow-scrolling: touch;
+        }
+        .tab {
+            background: transparent;
+            border: 1px solid #333;
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+            font-weight: 500;
+            cursor: pointer;
+            padding: 8px 20px;
+            border-radius: 20px;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+        .tab.active {
+            background: var(--text-primary);
+            color: var(--bg);
+            border-color: var(--text-primary);
+        }
+        .tab:hover:not(.active) {
+            border-color: var(--text-secondary);
+            color: var(--text-primary);
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 20px;
+        }
+        
+        .card {
+            background: var(--card-bg);
+            border-radius: 12px;
+            padding: 20px;
+            transition: transform 0.2s, box-shadow 0.2s;
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            cursor: pointer;
+            border: 1px solid transparent;
+            position: relative;
+            overflow: hidden;
+        }
+        .card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+            border-color: #333;
+        }
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+        .score-badge {
+            background: #333;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+            font-size: 0.75rem;
+        }
+        .score-high { color: #fb923c; background: rgba(251, 146, 60, 0.1); }
+        .score-med { color: #fbbf24; background: rgba(251, 191, 36, 0.1); }
+        
+        .card-title {
+            font-size: 1.1rem;
+            line-height: 1.5;
+            margin-bottom: 20px;
+            font-weight: 600;
+            flex-grow: 1;
+            display: -webkit-box;
+            -webkit-line-clamp: 4;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+        .card-meta {
+            display: flex;
+            gap: 15px;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-top: auto;
+            border-top: 1px solid #333;
+            padding-top: 15px;
+        }
+        .meta-item { display: flex; align-items: center; gap: 6px; }
+        
+        .refresh-btn {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: var(--accent);
+            color: white;
+            border: none;
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            box-shadow: 0 4px 20px rgba(255, 102, 0, 0.5);
+            cursor: pointer;
+            font-size: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: transform 0.2s, background 0.2s;
+            z-index: 100;
+        }
+        .refresh-btn:hover { transform: scale(1.1) rotate(180deg); background: #ff7722; }
+        .refresh-btn:active { transform: scale(0.95); }
+        
+        .empty-state {
+            grid-column: 1 / -1;
+            text-align: center;
+            padding: 80px 20px;
+            color: var(--text-secondary);
+        }
+        
+        /* Animation */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .card { animation: fadeIn 0.4s ease-out forwards; }
+
+        @media (max-width: 600px) {
+            .grid { grid-template-columns: 1fr; }
+            .container { padding: 15px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Discover</h1>
+            <a href="index.html" class="back-link">&larr; Back to Index</a>
+        </header>
+        
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('recommend', this)">✨ For You</button>
+            <button class="tab" onclick="switchTab('top-rated', this)">🏆 Top Rated</button>
+            <button class="tab" onclick="switchTab('discussed', this)">💬 Most Discussed</button>
+            <button class="tab" onclick="switchTab('latest', this)">📅 Latest</button>
+        </div>
+        
+        <div class="grid" id="content-grid">
+            <!-- Cards will be injected here -->
+        </div>
+    </div>
+    
+    <button class="refresh-btn" onclick="refreshRecommendations()" title="Refresh Recommendations" id="refreshBtn">↻</button>
+
+    <script>
+        // Data injected by Python
+        const allArticles = """ + json.dumps(all_articles) + """;
+        
+        let currentTab = 'recommend';
+        
+        function getCardHtml(article, index) {
+            const scoreClass = article.score >= 8 ? 'score-high' : (article.score >= 5 ? 'score-med' : '');
+            const detailUrl = `${article.date}/index.html#article-${article.id}`;
+            // Stagger animation delay based on index
+            const style = `animation-delay: ${index * 0.05}s`;
+            
+            return `
+                <div class="card" onclick="window.location.href='${detailUrl}'" style="${style}">
+                    <div class="card-header">
+                        <span>${article.date}</span>
+                        ${article.score ? `<span class="score-badge ${scoreClass}">AI Score: ${article.score}</span>` : ''}
+                    </div>
+                    <div class="card-title">${article.title}</div>
+                    <div class="card-meta">
+                        <div class="meta-item">❤️ ${article.points}</div>
+                        <div class="meta-item">💬 ${article.comments}</div>
+                    </div>
+                </div>
+            `;
+        }
+        
+        function renderArticles(articles) {
+            const grid = document.getElementById('content-grid');
+            if (articles.length === 0) {
+                grid.innerHTML = '<div class="empty-state">No articles found</div>';
+                return;
+            }
+            grid.innerHTML = articles.map((a, i) => getCardHtml(a, i)).join('');
+        }
+        
+        function shuffle(array) {
+            const newArr = [...array];
+            for (let i = newArr.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [newArr[i], newArr[j]] = [newArr[j], newArr[i]];
+            }
+            return newArr;
+        }
+        
+        function switchTab(tab, el) {
+            currentTab = tab;
+            // Update UI
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            el.classList.add('active');
+            
+            // Show/Hide refresh button
+            const btn = document.getElementById('refreshBtn');
+            btn.style.display = tab === 'recommend' ? 'flex' : 'none';
+            
+            refreshRecommendations(false);
+        }
+        
+        function refreshRecommendations(animate = true) {
+            let displayed = [];
+            
+            if (currentTab === 'recommend') {
+                // Random 12 items
+                displayed = shuffle(allArticles).slice(0, 12);
+            } else if (currentTab === 'top-rated') {
+                // Sort by AI score
+                displayed = [...allArticles].sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 50);
+            } else if (currentTab === 'discussed') {
+                // Sort by comments
+                displayed = [...allArticles].sort((a, b) => b.comments - a.comments).slice(0, 50);
+            } else if (currentTab === 'latest') {
+                 // Sort by date (desc)
+                 displayed = [...allArticles].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 50);
+            }
+            
+            renderArticles(displayed);
+            
+            if (animate && currentTab === 'recommend') {
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            }
+        }
+        
+        // Initial load
+        refreshRecommendations(false);
+    </script>
+</body>
+</html>"""
+
+    output_file = output_base / "recommend.html"
+    with open(output_file, 'w') as f:
+        f.write(html)
+        
+    print(f"Rendered recommendation page to {output_file} ({len(all_articles)} articles)")
 
 
 # -----------------------------------------------------------------------------
@@ -790,11 +1831,15 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="HN Time Capsule Pipeline")
-    parser.add_argument("stage", choices=["fetch", "prompt", "analyze", "parse", "render", "all"],
+    parser.add_argument("stage", choices=["fetch", "prompt", "analyze", "parse", "render", "render-index", "render-recommend", "all", "clean"],
                         help="Pipeline stage to run")
     parser.add_argument("--date", default=None, help="Target date (YYYY-MM-DD), defaults to 10 years ago")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of articles (for testing)")
     parser.add_argument("--model", default="gpt-5.1", help="OpenAI model for analysis")
+    parser.add_argument("--workers", type=int, default=15, help="Number of parallel workers for analysis")
+    parser.add_argument("--clean-stage", choices=["fetch", "prompt", "analyze", "parse"],
+                        help="For clean: only clean this stage and downstream (default: all)")
+    parser.add_argument("--article", help="For clean: only clean specific article by item_id")
 
     args = parser.parse_args()
 
@@ -806,16 +1851,24 @@ def main():
 
     print(f"Target date: {target_date}\n")
 
-    if args.stage == "fetch" or args.stage == "all":
-        stage_fetch(target_date, args.limit)
-    if args.stage == "prompt" or args.stage == "all":
-        stage_prompt(target_date)
-    if args.stage == "analyze" or args.stage == "all":
-        stage_analyze(target_date, args.model)
-    if args.stage == "parse" or args.stage == "all":
-        stage_parse(target_date)
-    if args.stage == "render" or args.stage == "all":
-        stage_render(target_date)
+    if args.stage == "clean":
+        stage_clean(target_date, args.clean_stage, args.article)
+    elif args.stage == "render-index":
+        stage_render_index()
+        stage_render_recommend()
+    elif args.stage == "render-recommend":
+        stage_render_recommend()
+    else:
+        if args.stage == "fetch" or args.stage == "all":
+            stage_fetch(target_date, args.limit)
+        if args.stage == "prompt" or args.stage == "all":
+            stage_prompt(target_date)
+        if args.stage == "analyze" or args.stage == "all":
+            stage_analyze(target_date, args.model, args.workers)
+        if args.stage == "parse" or args.stage == "all":
+            stage_parse(target_date)
+        if args.stage == "render" or args.stage == "all":
+            stage_render(target_date)  # This also calls stage_render_index()
 
 
 if __name__ == "__main__":
