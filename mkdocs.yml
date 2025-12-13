@@ -1,0 +1,35 @@
+site_name: 香港攻略信用卡
+site_description: 香港信用卡攻略与权益指南（持续更新）
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - content.code.copy
+
+nav:
+  - 首页: index.md
+  - 快速开始: 01-快速开始.md
+  - 选卡方法论: 02-选卡方法论.md
+  - 权益与回赠:
+      - 里数与积分: 03-里数与积分.md
+      - 旅行与机场权益: 04-旅行与机场权益.md
+      - 现金回赠与生活类: 05-现金回赠与生活类.md
+  - 申请与用卡:
+      - 申请流程与材料: 06-申请流程与材料.md
+      - 年费与费用避坑: 07-年费与费用避坑.md
+      - 风控/封卡/拒批应对: 08-风控与拒批.md
+  - 附录:
+      - 术语表: 90-术语表.md
+      - 常见问题: 91-常见问题.md
+      - 更新日志: 99-更新日志.md
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
